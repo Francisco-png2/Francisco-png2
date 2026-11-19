@@ -21,7 +21,7 @@ Atualmente, sou estudante de Sistemas de Informação na UFSM Busco constantemen
 
 <table align="center">
   <tr><th>Competência</th><th>Proficiência</th><th>Área</th></tr>
-  <tr><td>HTML, CSS e JavaScript</td><td>⭐</td><td>Front-end</td></tr>
+  <tr><td>HTML, CSS e JavaScript</td><td>⭐⭐⭐⭐</td><td>Front-end</td></tr>
   <tr><td>React</td><td></td><td>Front-end</td></tr>
   <tr><td>Angular</td><td></td><td>Front-end</td></tr>
   <tr><td>Tailwind e Boostrap</td><td></td><td>Front-end</td></tr>
