@@ -30,7 +30,7 @@ Atualmente, sou estudante de Sistemas de Informação na UFSM Busco constantemen
   <tr><td>FastAPI</td><td></td><td>Back-end</td></tr>
   <tr><td>C e C++</td><td>⭐⭐</td><td>Back-end</td></tr>
   <tr><td>Java</td><td>⭐</td><td>Back-end</td></tr>
-  <tr><td>MySQL</td><td>⭐⭐</td><td>Banco de Dados</td></tr>
+  <tr><td>MySQL</td><td></td><td>Banco de Dados</td></tr>
   <tr><td>PostgreSQL</td><td>⭐</td><td>Banco de Dados</td></tr>
   <tr><td>Git & GitHub</td><td>⭐⭐⭐⭐⭐</td><td>Controle de Versão</td></tr>
   <tr><td>Linux</td><td>⭐⭐⭐⭐⭐</td><td>Sistema Operacional</td></tr>
