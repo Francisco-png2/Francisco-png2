@@ -22,16 +22,16 @@ Atualmente, sou estudante de Sistemas de Informação na UFSM Busco constantemen
 <table align="center">
   <tr><th>Competência</th><th>Proficiência</th><th>Área</th></tr>
   <tr><td>HTML, CSS e JavaScript</td><td>⭐⭐⭐⭐</td><td>Front-end</td></tr>
-  <tr><td>React</td><td></td><td>Front-end</td></tr>
-  <tr><td>Angular</td><td></td><td>Front-end</td></tr>
+  <tr><td>React</td><td></td>⭐<td>Front-end</td></tr>
+  <tr><td>Angular</td><td></td>⭐<td>Front-end</td></tr>
   <tr><td>Tailwind e Boostrap</td><td></td><td>Front-end</td></tr>
-  <tr><td>Python</td><td>⭐</td><td>Back-end / IA</td></tr>
-  <tr><td>Django</td><td></td><td>Back-end</td></tr>
+  <tr><td>Python</td><td>⭐⭐⭐⭐</td><td>Back-end / IA</td></tr>
+  <tr><td>Django</td><td>⭐</td><td>Back-end</td></tr>
   <tr><td>FastAPI</td><td></td><td>Back-end</td></tr>
   <tr><td>C e C++</td><td>⭐⭐</td><td>Back-end</td></tr>
-  <tr><td>Java</td><td></td><td>Back-end</td></tr>
-  <tr><td>MySQL</td><td></td><td>Banco de Dados</td></tr>
-  <tr><td>PostgreSQL</td><td></td><td>Banco de Dados</td></tr>
+  <tr><td>Java</td><td>⭐</td><td>Back-end</td></tr>
+  <tr><td>MySQL</td><td>⭐⭐</td><td>Banco de Dados</td></tr>
+  <tr><td>PostgreSQL</td><td>⭐</td><td>Banco de Dados</td></tr>
   <tr><td>Git & GitHub</td><td>⭐⭐⭐⭐⭐</td><td>Controle de Versão</td></tr>
   <tr><td>Linux</td><td>⭐⭐⭐⭐⭐</td><td>Sistema Operacional</td></tr>
   <tr><td>Lua</td><td>⭐⭐</td><td>Roblox</td></tr>
