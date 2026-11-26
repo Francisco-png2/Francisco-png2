@@ -1,68 +1,76 @@
-# Sistema de Gerenciamento de Vendas
+# Sistema de Gerenciamento de Vendas (C)
 
-Sistema em **Python 3** com banco de dados **SQLite** (sem dependências externas) para cadastro e gerenciamento de **clientes**, **produtos** e **vendas**, com relatórios gerenciais.
+Sistema em **linguagem C (C99)** para cadastro e gerenciamento de **clientes**, **produtos** e **vendas**, com relatórios gerenciais. Usa apenas a biblioteca padrão do C, sem dependências externas. Os dados são **armazenados em arquivos** e continuam disponíveis entre execuções.
 
-## Como executar
+## Como compilar e executar
 
-```bash
-cd sistema-vendas
-python3 main.py --exemplo   # primeira vez: cria vendas.db com dados de exemplo
-python3 main.py             # uso normal (os dados ficam salvos em vendas.db)
-python3 main.py --db outro.db
-```
-
-Testes:
+Com `make` (Linux, macOS, MSYS2/MinGW):
 
 ```bash
-python3 -m unittest discover -s tests -v
+make            # gera o executável ./sistema
+make test       # compila e executa os testes automatizados
+./sistema --exemplo   # primeira vez: popula com dados de exemplo
+./sistema             # uso normal
 ```
+
+Sem `make` (qualquer compilador C, incluindo Windows/MinGW ou Code::Blocks):
+
+```bash
+gcc -std=c99 -Wall -o sistema src/dados.c src/relatorios.c src/main.c
+```
+
+Opções: `--dados PASTA` (pasta dos arquivos, padrão `dados/`) e `--exemplo` (insere 5 clientes, 6 produtos e 40 vendas se a base estiver vazia).
 
 ## Funcionalidades
 
 | Módulo | Operações |
 |---|---|
-| Clientes | cadastrar, listar/pesquisar (nome, CPF, e-mail), ordenar, consultar, alterar, excluir |
-| Produtos | cadastrar, listar/pesquisar, ordenar (nome, preço, estoque), consultar, alterar, excluir |
-| Vendas | registrar venda com vários itens, listar, detalhar, cancelar (devolve ao estoque) |
+| Clientes | cadastrar, listar/pesquisar (nome, CPF, e-mail), ordenar (nome, ID, data de cadastro), consultar, alterar, excluir |
+| Produtos | cadastrar, listar/pesquisar (nome, descrição), ordenar (nome, ID, preço, estoque), consultar, alterar, excluir |
+| Vendas | registrar venda com vários itens, listar, detalhar, cancelar (devolve os itens ao estoque) |
 
 Regras de negócio:
-- CPF com 11 dígitos e único por cliente.
-- A venda é gravada em uma **transação**: se algum item não tiver estoque, nada é gravado.
-- O **preço unitário é registrado no momento da venda**, então alterar o preço de um produto não muda vendas antigas.
+- CPF obrigatório, com 11 dígitos e único por cliente (pode ser digitado com pontos e traço).
+- A venda é "tudo ou nada": se faltar estoque de algum item, nada é gravado.
+- O **preço unitário é gravado no momento da venda**, então mudar o preço de um produto não altera vendas antigas.
 - O estoque é baixado ao vender e devolvido ao cancelar.
-- Clientes e produtos que já constam em vendas não podem ser excluídos (integridade referencial).
+- Clientes e produtos que já constam em vendas não podem ser excluídos.
+- Valores em dinheiro são guardados em **centavos** (`long long`) para evitar erros de arredondamento.
 
 ## Relatórios
 
 | # | Relatório | O que mostra |
 |---|---|---|
-| 1 | Melhores clientes | ranking por **quantidade de compras** ou **valor total** |
+| 1 | Melhores clientes | ranking por **quantidade de compras** ou por **valor total** |
 | 2 | Clientes com maior valor em compras | valor total, nº de compras e ticket médio |
-| 3 | Produtos mais vendidos | unidades vendidas por produto |
-| 4 | Vendas por período | vendas entre duas datas |
-| 5 | Faturamento por período | total, nº de vendas, ticket médio e detalhamento diário |
+| 3 | Produtos mais vendidos | unidades vendidas e faturamento por produto |
+| 4 | Vendas por período | vendas entre duas datas (DD/MM/AAAA) |
+| 5 | Faturamento por período | total, nº de vendas, ticket médio e detalhamento por dia |
 | 6 | Histórico de compras do cliente | todas as compras de um cliente, item a item |
-| 7 | Desempenho por produto | nº de vendas, unidades e valor gerado por produto |
+| 7 | Desempenho por produto | nº de vendas, unidades e valor gerado (inclui produtos nunca vendidos) |
 | 8 | Produtos com maior faturamento | faturamento e participação % no total |
 
 ## Estrutura
 
 ```
 sistema-vendas/
-├── main.py               # ponto de entrada (menu interativo)
-├── vendas/
-│   ├── db.py             # conexão e esquema do banco
-│   ├── repositorios.py   # CRUD de clientes, produtos e vendas
-│   ├── relatorios.py     # consultas SQL dos relatórios
-│   └── cli.py            # menus e telas no terminal
-└── tests/test_sistema.py
+├── Makefile
+├── src/
+│   ├── dados.h / dados.c           # estruturas, arquivos e CRUD (regras de negócio)
+│   ├── relatorios.h / relatorios.c # cálculo dos 8 relatórios
+│   └── main.c                      # menus, leitura de dados e exibição em tabelas
+└── tests/testes.c                  # testes automatizados
 ```
 
-## Modelo de dados
+## Armazenamento
+
+Na pasta `dados/`, um registro por linha, campos separados por `|`:
 
 ```
-clientes (id, nome, cpf UNIQUE, email, telefone, endereco, criado_em)
-produtos (id, nome, descricao, preco, estoque, criado_em)
-vendas   (id, cliente_id → clientes, data, total)
-itens_venda (id, venda_id → vendas, produto_id → produtos, quantidade, preco_unitario)
+clientes.txt : id|nome|cpf|email|telefone|endereco|data_cadastro
+produtos.txt : id|nome|descricao|preco_centavos|estoque
+vendas.txt   : id|cliente_id|data|total_centavos
+itens.txt    : venda_id|produto_id|quantidade|preco_unitario_centavos
 ```
+
+Os arquivos são gravados após cada alteração, primeiro em um arquivo temporário que depois substitui o original. Assim os dados não se corrompem se o programa for interrompido no meio de uma gravação.

@@ -1,2 +1,6 @@
-*.db
-__pycache__/
+sistema
+testes
+*.exe
+*.o
+dados/
+dados_teste_tmp/
