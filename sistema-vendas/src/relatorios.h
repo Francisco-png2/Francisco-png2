@@ -1,7 +1,8 @@
 /*
- * relatorios.h - Relatórios gerenciais sobre clientes, produtos e vendas.
+ * relatorios.h - Relatórios gerenciais (consultas SQL no PostgreSQL).
  *
- * Todas as funções que retornam vetores alocam memória: libere com free().
+ * Funções que retornam vetores alocam memória: libere com free().
+ * Retornam a quantidade de linhas, ou -1 em caso de erro (veja bd_erro()).
  * Períodos são informados como "AAAA-MM-DD" e incluem os dois dias extremos.
  */
 #ifndef RELATORIOS_H
@@ -56,9 +57,9 @@ int rel_melhores_clientes(BaseDados *bd, int por_valor, int limite, RelCliente *
 int rel_clientes_maior_valor(BaseDados *bd, int limite, RelCliente **saida);
 /* 3. Produtos com maior quantidade de unidades vendidas. */
 int rel_produtos_mais_vendidos(BaseDados *bd, int limite, RelProduto **saida);
-/* 4. Vendas no período (ordem cronológica). Retorna -1 se o período for inválido. */
-int rel_vendas_periodo(BaseDados *bd, const char *inicio, const char *fim, Venda ***saida);
-/* 5. Faturamento no período. Retorna ERRO_VALIDACAO se o período for inválido. */
+/* 4. Vendas no período (ordem cronológica). */
+int rel_vendas_periodo(BaseDados *bd, const char *inicio, const char *fim, Venda **saida);
+/* 5. Faturamento no período, com detalhamento por dia. */
 Status rel_faturamento_periodo(BaseDados *bd, const char *inicio, const char *fim,
                                RelFaturamento *saida);
 /* 6. Histórico de compras de um cliente (uma linha por item, mais recentes primeiro). */

@@ -1,14 +1,9 @@
 /*
- * dados.c - Persistência em arquivos texto e regras de negócio dos cadastros.
+ * dados.c - Conexão com o PostgreSQL (libpq) e regras de negócio dos cadastros.
  *
- * Cada entidade é gravada em um arquivo próprio dentro da pasta de dados,
- * um registro por linha, com campos separados por '|':
- *   clientes.txt : id|nome|cpf|email|telefone|endereco|criado_em
- *   produtos.txt : id|nome|descricao|preco_centavos|estoque
- *   vendas.txt   : id|cliente_id|data|total_centavos
- *   itens.txt    : venda_id|produto_id|quantidade|preco_unitario_centavos
+ * Todos os comandos usam PQexecParams com parâmetros ($1, $2, ...), nunca
+ * concatenando texto digitado pelo usuário no SQL (evita SQL injection).
  */
-#define _POSIX_C_SOURCE 200809L
 #define __USE_MINGW_ANSI_STDIO 1
 
 #include "dados.h"
@@ -18,21 +13,42 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
-#ifdef _WIN32
-#include <direct.h>
-#define CRIAR_PASTA(p) _mkdir(p)
-#else
-#include <sys/stat.h>
-#define CRIAR_PASTA(p) mkdir((p), 0755)
-#endif
-
-#define TAM_LINHA 1024
+/* Mesmo conteúdo de sql/schema.sql: executado ao conectar. */
+static const char *ESQUEMA =
+    "CREATE TABLE IF NOT EXISTS clientes ("
+    "  id         SERIAL PRIMARY KEY,"
+    "  nome       VARCHAR(100) NOT NULL,"
+    "  cpf        CHAR(11)     NOT NULL UNIQUE,"
+    "  email      VARCHAR(100),"
+    "  telefone   VARCHAR(30),"
+    "  endereco   VARCHAR(150),"
+    "  criado_em  TIMESTAMP(0) NOT NULL DEFAULT LOCALTIMESTAMP(0));"
+    "CREATE TABLE IF NOT EXISTS produtos ("
+    "  id         SERIAL PRIMARY KEY,"
+    "  nome       VARCHAR(100)  NOT NULL,"
+    "  descricao  VARCHAR(200),"
+    "  preco      NUMERIC(12,2) NOT NULL CHECK (preco >= 0),"
+    "  estoque    INTEGER       NOT NULL DEFAULT 0 CHECK (estoque >= 0));"
+    "CREATE TABLE IF NOT EXISTS vendas ("
+    "  id         SERIAL PRIMARY KEY,"
+    "  cliente_id INTEGER       NOT NULL REFERENCES clientes(id) ON DELETE RESTRICT,"
+    "  data       TIMESTAMP(0)  NOT NULL DEFAULT LOCALTIMESTAMP(0),"
+    "  total      NUMERIC(12,2) NOT NULL DEFAULT 0);"
+    "CREATE TABLE IF NOT EXISTS itens_venda ("
+    "  id             SERIAL PRIMARY KEY,"
+    "  venda_id       INTEGER       NOT NULL REFERENCES vendas(id) ON DELETE CASCADE,"
+    "  produto_id     INTEGER       NOT NULL REFERENCES produtos(id) ON DELETE RESTRICT,"
+    "  quantidade     INTEGER       NOT NULL CHECK (quantidade > 0),"
+    "  preco_unitario NUMERIC(12,2) NOT NULL CHECK (preco_unitario >= 0),"
+    "  UNIQUE (venda_id, produto_id));"
+    "CREATE INDEX IF NOT EXISTS idx_vendas_cliente ON vendas(cliente_id);"
+    "CREATE INDEX IF NOT EXISTS idx_vendas_data    ON vendas(data);"
+    "CREATE INDEX IF NOT EXISTS idx_itens_produto  ON itens_venda(produto_id);";
 
 /* ------------------------------------------------------------ utilitários */
 
-static char msg_erro[256];
+static char msg_erro[512];
 
 const char *bd_erro(void) { return msg_erro; }
 
@@ -45,18 +61,14 @@ static Status falha(Status st, const char *fmt, ...)
     return st;
 }
 
-/* Copia o texto removendo espaços nas pontas e trocando '|' e quebras de linha
- * (que quebrariam o formato do arquivo) por espaço. */
+/* Copia o texto removendo espaços nas pontas, sem cortar caracteres UTF-8. */
 static void copiar_texto(char *dest, size_t tam, const char *orig)
 {
     size_t i = 0;
     if (orig == NULL) orig = "";
     while (*orig && isspace((unsigned char)*orig)) orig++;
-    for (; orig[i] && i < tam - 1; i++) {
-        char c = orig[i];
-        dest[i] = (c == '|' || c == '\n' || c == '\r') ? ' ' : c;
-    }
-    if (orig[i]) { /* truncado: não deixa um caractere UTF-8 pela metade */
+    for (; orig[i] && i < tam - 1; i++) dest[i] = (orig[i] == '\n' || orig[i] == '\r') ? ' ' : orig[i];
+    if (orig[i]) {
         while (i > 0 && ((unsigned char)dest[i - 1] & 0xC0) == 0x80) i--;
         if (i > 0 && (unsigned char)dest[i - 1] >= 0xC0) i--;
     }
@@ -64,7 +76,6 @@ static void copiar_texto(char *dest, size_t tam, const char *orig)
     while (i > 0 && isspace((unsigned char)dest[i - 1])) dest[--i] = '\0';
 }
 
-/* Mantém apenas os dígitos. Retorna a quantidade de dígitos encontrados. */
 static size_t somente_digitos(const char *orig, char *dest, size_t tam)
 {
     size_t n = 0, total = 0;
@@ -78,267 +89,120 @@ static size_t somente_digitos(const char *orig, char *dest, size_t tam)
     return total;
 }
 
-/* Garante espaço para 'necessario' elementos no vetor dinâmico. */
-static int garantir(void **vetor, int *cap, int necessario, size_t tam_elem)
-{
-    int nova = *cap ? *cap : 16;
-    void *novo;
-    if (necessario <= *cap) return 1;
-    while (nova < necessario) nova *= 2;
-    novo = realloc(*vetor, (size_t)nova * tam_elem);
-    if (novo == NULL) return 0;
-    *vetor = novo;
-    *cap = nova;
-    return 1;
-}
+/* Campos opcionais vazios são gravados como NULL. */
+static const char *ou_nulo(const char *s) { return (s && *s) ? s : NULL; }
 
-static int compara_sem_caixa(const char *a, const char *b)
+/* ------------------------------------------------------------ libpq */
+
+PGresult *bd_executar(BaseDados *bd, Status *st, const char *sql, int n_params,
+                      const char *const *params)
 {
-    for (; *a && *b; a++, b++) {
-        int d = tolower((unsigned char)*a) - tolower((unsigned char)*b);
-        if (d) return d;
+    PGresult *r = PQexecParams(bd->conn, sql, n_params, NULL, params, NULL, NULL, 0);
+    ExecStatusType es = PQresultStatus(r);
+    const char *estado;
+    Status erro;
+    if (es == PGRES_COMMAND_OK || es == PGRES_TUPLES_OK) {
+        if (st) *st = OK;
+        return r;
     }
-    return tolower((unsigned char)*a) - tolower((unsigned char)*b);
-}
-
-static int contem_sem_caixa(const char *texto, const char *termo)
-{
-    size_t n = strlen(termo);
-    if (n == 0) return 1;
-    for (; *texto; texto++) {
-        size_t i = 0;
-        while (i < n && texto[i] &&
-               tolower((unsigned char)texto[i]) == tolower((unsigned char)termo[i]))
-            i++;
-        if (i == n) return 1;
-    }
-    return 0;
-}
-
-void data_agora(char destino[TAM_DATA])
-{
-    time_t t = time(NULL);
-    strftime(destino, TAM_DATA, "%Y-%m-%d %H:%M:%S", localtime(&t));
-}
-
-/* ------------------------------------------------------------ arquivos */
-
-static void caminho(const BaseDados *bd, const char *arquivo, char *dest, size_t tam)
-{
-    snprintf(dest, tam, "%s/%s", bd->dir, arquivo);
-}
-
-/* Divide a linha em campos separados por '|' (preserva campos vazios). */
-static int dividir(char *linha, char **campos, int max)
-{
-    int n = 0;
-    char *p = linha;
-    campos[n++] = p;
-    for (; *p; p++) {
-        if (*p == '\n' || *p == '\r') { *p = '\0'; break; }
-        if (*p == '|') {
-            *p = '\0';
-            if (n == max) break;
-            campos[n++] = p + 1;
-        }
-    }
-    return n;
-}
-
-static void atualiza_prox(int *prox, int id) { if (id >= *prox) *prox = id + 1; }
-
-static Status carregar(BaseDados *bd, const char *arquivo, int n_campos,
-                       Status (*registro)(BaseDados *, char **))
-{
-    char nome[TAM_DIR + 32], linha[TAM_LINHA], *campos[8];
-    FILE *f;
-    Status st = OK;
-    caminho(bd, arquivo, nome, sizeof nome);
-    f = fopen(nome, "r");
-    if (f == NULL) return OK; /* arquivo ainda não existe: base vazia */
-    while (st == OK && fgets(linha, sizeof linha, f)) {
-        if (dividir(linha, campos, 8) >= n_campos) st = registro(bd, campos);
-    }
-    fclose(f);
-    return st;
-}
-
-static Status reg_cliente(BaseDados *bd, char **c)
-{
-    Cliente *x;
-    if (!garantir((void **)&bd->clientes, &bd->cap_clientes, bd->n_clientes + 1, sizeof *x))
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
-    x = &bd->clientes[bd->n_clientes++];
-    x->id = atoi(c[0]);
-    copiar_texto(x->nome, sizeof x->nome, c[1]);
-    copiar_texto(x->cpf, sizeof x->cpf, c[2]);
-    copiar_texto(x->email, sizeof x->email, c[3]);
-    copiar_texto(x->telefone, sizeof x->telefone, c[4]);
-    copiar_texto(x->endereco, sizeof x->endereco, c[5]);
-    copiar_texto(x->criado_em, sizeof x->criado_em, c[6]);
-    atualiza_prox(&bd->prox_cliente, x->id);
-    return OK;
-}
-
-static Status reg_produto(BaseDados *bd, char **c)
-{
-    Produto *x;
-    if (!garantir((void **)&bd->produtos, &bd->cap_produtos, bd->n_produtos + 1, sizeof *x))
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
-    x = &bd->produtos[bd->n_produtos++];
-    x->id = atoi(c[0]);
-    copiar_texto(x->nome, sizeof x->nome, c[1]);
-    copiar_texto(x->descricao, sizeof x->descricao, c[2]);
-    x->preco = atoll(c[3]);
-    x->estoque = atoi(c[4]);
-    atualiza_prox(&bd->prox_produto, x->id);
-    return OK;
-}
-
-static Status reg_venda(BaseDados *bd, char **c)
-{
-    Venda *x;
-    if (!garantir((void **)&bd->vendas, &bd->cap_vendas, bd->n_vendas + 1, sizeof *x))
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
-    x = &bd->vendas[bd->n_vendas++];
-    x->id = atoi(c[0]);
-    x->cliente_id = atoi(c[1]);
-    copiar_texto(x->data, sizeof x->data, c[2]);
-    x->total = atoll(c[3]);
-    atualiza_prox(&bd->prox_venda, x->id);
-    return OK;
-}
-
-static Status reg_item(BaseDados *bd, char **c)
-{
-    ItemVenda *x;
-    if (!garantir((void **)&bd->itens, &bd->cap_itens, bd->n_itens + 1, sizeof *x))
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
-    x = &bd->itens[bd->n_itens++];
-    x->venda_id = atoi(c[0]);
-    x->produto_id = atoi(c[1]);
-    x->quantidade = atoi(c[2]);
-    x->preco_unitario = atoll(c[3]);
-    return OK;
-}
-
-static void esc_clientes(const BaseDados *bd, FILE *f)
-{
-    int i;
-    for (i = 0; i < bd->n_clientes; i++) {
-        const Cliente *x = &bd->clientes[i];
-        fprintf(f, "%d|%s|%s|%s|%s|%s|%s\n", x->id, x->nome, x->cpf, x->email,
-                x->telefone, x->endereco, x->criado_em);
-    }
-}
-
-static void esc_produtos(const BaseDados *bd, FILE *f)
-{
-    int i;
-    for (i = 0; i < bd->n_produtos; i++) {
-        const Produto *x = &bd->produtos[i];
-        fprintf(f, "%d|%s|%s|%lld|%d\n", x->id, x->nome, x->descricao, x->preco, x->estoque);
-    }
-}
-
-static void esc_vendas(const BaseDados *bd, FILE *f)
-{
-    int i;
-    for (i = 0; i < bd->n_vendas; i++) {
-        const Venda *x = &bd->vendas[i];
-        fprintf(f, "%d|%d|%s|%lld\n", x->id, x->cliente_id, x->data, x->total);
-    }
-}
-
-static void esc_itens(const BaseDados *bd, FILE *f)
-{
-    int i;
-    for (i = 0; i < bd->n_itens; i++) {
-        const ItemVenda *x = &bd->itens[i];
-        fprintf(f, "%d|%d|%d|%lld\n", x->venda_id, x->produto_id, x->quantidade,
-                x->preco_unitario);
-    }
-}
-
-/* Grava em um arquivo temporário e só depois substitui o original,
- * para não corromper os dados se a gravação for interrompida. */
-static Status gravar(const BaseDados *bd, const char *arquivo,
-                     void (*escrever)(const BaseDados *, FILE *))
-{
-    char final[TAM_DIR + 32], temp[TAM_DIR + 40];
-    FILE *f;
-    caminho(bd, arquivo, final, sizeof final);
-    snprintf(temp, sizeof temp, "%s.tmp", final);
-    f = fopen(temp, "w");
-    if (f == NULL) return falha(ERRO_ARQUIVO, "Não foi possível gravar %s.", final);
-    escrever(bd, f);
-    if (fclose(f) != 0) return falha(ERRO_ARQUIVO, "Erro ao gravar %s.", final);
-    remove(final);
-    if (rename(temp, final) != 0) return falha(ERRO_ARQUIVO, "Erro ao substituir %s.", final);
-    return OK;
-}
-
-Status bd_abrir(BaseDados *bd, const char *dir)
-{
-    Status st;
-    memset(bd, 0, sizeof *bd);
-    bd->prox_cliente = bd->prox_produto = bd->prox_venda = 1;
-    if (dir == NULL || dir[0] == '\0') return OK;
-    copiar_texto(bd->dir, sizeof bd->dir, dir);
-    CRIAR_PASTA(bd->dir); /* ignora erro se já existir */
-    if ((st = carregar(bd, "clientes.txt", 7, reg_cliente)) != OK) return st;
-    if ((st = carregar(bd, "produtos.txt", 5, reg_produto)) != OK) return st;
-    if ((st = carregar(bd, "vendas.txt", 4, reg_venda)) != OK) return st;
-    return carregar(bd, "itens.txt", 4, reg_item);
-}
-
-Status bd_salvar(BaseDados *bd)
-{
-    Status st;
-    if (bd->dir[0] == '\0') return OK;
-    if ((st = gravar(bd, "clientes.txt", esc_clientes)) != OK) return st;
-    if ((st = gravar(bd, "produtos.txt", esc_produtos)) != OK) return st;
-    if ((st = gravar(bd, "vendas.txt", esc_vendas)) != OK) return st;
-    return gravar(bd, "itens.txt", esc_itens);
-}
-
-void bd_fechar(BaseDados *bd)
-{
-    free(bd->clientes);
-    free(bd->produtos);
-    free(bd->vendas);
-    free(bd->itens);
-    memset(bd, 0, sizeof *bd);
-}
-
-/* ------------------------------------------------------------ clientes */
-
-Cliente *cliente_buscar(BaseDados *bd, int id)
-{
-    int i;
-    for (i = 0; i < bd->n_clientes; i++)
-        if (bd->clientes[i].id == id) return &bd->clientes[i];
+    /* Converte o código SQLSTATE do PostgreSQL em um Status do sistema:
+     * 23505 = valor único repetido, 23503 = chave estrangeira,
+     * 23xxx/22xxx = restrição violada ou dado inválido. */
+    estado = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+    if (estado == NULL) estado = "";
+    if (strcmp(estado, "23505") == 0)
+        erro = falha(ERRO_DUPLICADO, "Registro duplicado.");
+    else if (strcmp(estado, "23503") == 0)
+        erro = falha(ERRO_VINCULO, "O registro está vinculado a outros dados.");
+    else if (strncmp(estado, "23", 2) == 0 || strncmp(estado, "22", 2) == 0)
+        erro = falha(ERRO_VALIDACAO, "Dados inválidos: %s", PQresultErrorMessage(r));
+    else
+        erro = falha(ERRO_BANCO, "Erro no banco de dados: %s", PQerrorMessage(bd->conn));
+    if (st) *st = erro;
+    PQclear(r);
     return NULL;
 }
 
-static int cpf_em_uso(const BaseDados *bd, const char *cpf, int ignorar_id)
+/* Executa um comando sem resultado de interesse. */
+static Status comando(BaseDados *bd, const char *sql, int n, const char *const *params)
 {
-    int i;
-    for (i = 0; i < bd->n_clientes; i++)
-        if (bd->clientes[i].id != ignorar_id && strcmp(bd->clientes[i].cpf, cpf) == 0) return 1;
-    return 0;
+    Status st;
+    PGresult *r = bd_executar(bd, &st, sql, n, params);
+    PQclear(r);
+    return st;
 }
 
-/* Valida e normaliza os campos do cliente em 'c'. */
-static Status validar_cliente(const BaseDados *bd, Cliente *c, const char *cpf_digitado)
+int pg_int(const PGresult *r, int l, int c) { return atoi(PQgetvalue(r, l, c)); }
+
+long long pg_ll(const PGresult *r, int l, int c) { return atoll(PQgetvalue(r, l, c)); }
+
+void pg_txt(const PGresult *r, int l, int c, char *dest, size_t tam)
+{
+    snprintf(dest, tam, "%s", PQgetisnull(r, l, c) ? "" : PQgetvalue(r, l, c));
+}
+
+Status bd_conectar(BaseDados *bd, const char *conexao)
+{
+    bd->conn = PQconnectdb(conexao ? conexao : "");
+    if (PQstatus(bd->conn) != CONNECTION_OK) {
+        Status st = falha(ERRO_BANCO, "Não foi possível conectar ao PostgreSQL: %s",
+                          PQerrorMessage(bd->conn));
+        PQfinish(bd->conn);
+        bd->conn = NULL;
+        return st;
+    }
+    PQsetClientEncoding(bd->conn, "UTF8");
+    /* NOTICE "relation already exists" do CREATE IF NOT EXISTS não interessa */
+    PQclear(PQexec(bd->conn, "SET client_min_messages TO WARNING"));
+    {
+        PGresult *r = PQexec(bd->conn, ESQUEMA);
+        Status st = OK;
+        if (PQresultStatus(r) != PGRES_COMMAND_OK)
+            st = falha(ERRO_BANCO, "Erro ao criar as tabelas: %s", PQerrorMessage(bd->conn));
+        PQclear(r);
+        return st;
+    }
+}
+
+void bd_desconectar(BaseDados *bd)
+{
+    if (bd->conn) PQfinish(bd->conn);
+    bd->conn = NULL;
+}
+
+Status bd_limpar(BaseDados *bd)
+{
+    return comando(bd, "TRUNCATE itens_venda, vendas, produtos, clientes RESTART IDENTITY", 0,
+                   NULL);
+}
+
+static Status iniciar(BaseDados *bd) { return comando(bd, "BEGIN", 0, NULL); }
+static Status confirmar_transacao(BaseDados *bd) { return comando(bd, "COMMIT", 0, NULL); }
+static void desfazer(BaseDados *bd) { PQclear(PQexec(bd->conn, "ROLLBACK")); }
+
+/* ------------------------------------------------------------ clientes */
+
+#define SQL_CLIENTE_CAMPOS \
+    "id, nome, cpf, email, telefone, endereco, to_char(criado_em, 'YYYY-MM-DD HH24:MI:SS')"
+
+static void ler_cliente(const PGresult *r, int l, Cliente *c)
+{
+    c->id = pg_int(r, l, 0);
+    pg_txt(r, l, 1, c->nome, sizeof c->nome);
+    pg_txt(r, l, 2, c->cpf, sizeof c->cpf);
+    pg_txt(r, l, 3, c->email, sizeof c->email);
+    pg_txt(r, l, 4, c->telefone, sizeof c->telefone);
+    pg_txt(r, l, 5, c->endereco, sizeof c->endereco);
+    pg_txt(r, l, 6, c->criado_em, sizeof c->criado_em);
+}
+
+static Status validar_cliente(Cliente *c, const char *cpf_digitado)
 {
     char digitos[64];
     if (c->nome[0] == '\0') return falha(ERRO_VALIDACAO, "O nome do cliente é obrigatório.");
     if (somente_digitos(cpf_digitado, digitos, sizeof digitos) != 11)
         return falha(ERRO_VALIDACAO, "O CPF deve conter 11 dígitos.");
     strcpy(c->cpf, digitos);
-    if (cpf_em_uso(bd, c->cpf, c->id))
-        return falha(ERRO_DUPLICADO, "Já existe um cliente com o CPF %s.", c->cpf);
     return OK;
 }
 
@@ -347,96 +211,123 @@ Status cliente_cadastrar(BaseDados *bd, const char *nome, const char *cpf, const
 {
     Cliente c;
     Status st;
+    PGresult *r;
+    const char *p[5];
     memset(&c, 0, sizeof c);
-    c.id = bd->prox_cliente;
     copiar_texto(c.nome, sizeof c.nome, nome);
     copiar_texto(c.email, sizeof c.email, email);
     copiar_texto(c.telefone, sizeof c.telefone, telefone);
     copiar_texto(c.endereco, sizeof c.endereco, endereco);
-    if ((st = validar_cliente(bd, &c, cpf)) != OK) return st;
-    data_agora(c.criado_em);
-    if (!garantir((void **)&bd->clientes, &bd->cap_clientes, bd->n_clientes + 1, sizeof c))
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
-    bd->clientes[bd->n_clientes++] = c;
-    bd->prox_cliente++;
-    if (novo_id) *novo_id = c.id;
-    return bd_salvar(bd);
+    if ((st = validar_cliente(&c, cpf)) != OK) return st;
+    p[0] = c.nome; p[1] = c.cpf; p[2] = ou_nulo(c.email);
+    p[3] = ou_nulo(c.telefone); p[4] = ou_nulo(c.endereco);
+    r = bd_executar(bd, &st,
+                    "INSERT INTO clientes (nome, cpf, email, telefone, endereco) "
+                    "VALUES ($1, $2, $3, $4, $5) RETURNING id", 5, p);
+    if (st == ERRO_DUPLICADO) return falha(st, "Já existe um cliente com o CPF %s.", c.cpf);
+    if (r == NULL) return st;
+    if (novo_id) *novo_id = pg_int(r, 0, 0);
+    PQclear(r);
+    return OK;
+}
+
+Status cliente_buscar(BaseDados *bd, int id, Cliente *saida)
+{
+    char sid[16];
+    const char *p[1] = {sid};
+    Status st;
+    PGresult *r;
+    snprintf(sid, sizeof sid, "%d", id);
+    r = bd_executar(bd, &st, "SELECT " SQL_CLIENTE_CAMPOS " FROM clientes WHERE id = $1", 1, p);
+    if (r == NULL) return st;
+    if (PQntuples(r) == 0) st = falha(ERRO_NAO_ENCONTRADO, "Cliente %d não encontrado.", id);
+    else if (saida) ler_cliente(r, 0, saida);
+    PQclear(r);
+    return st;
 }
 
 Status cliente_alterar(BaseDados *bd, int id, const char *nome, const char *cpf,
                        const char *email, const char *telefone, const char *endereco)
 {
-    Cliente *atual = cliente_buscar(bd, id);
     Cliente c;
     Status st;
-    if (atual == NULL) return falha(ERRO_NAO_ENCONTRADO, "Cliente %d não encontrado.", id);
-    c = *atual;
+    char sid[16];
+    const char *p[6];
+    if ((st = cliente_buscar(bd, id, &c)) != OK) return st;
     if (nome) copiar_texto(c.nome, sizeof c.nome, nome);
     if (email) copiar_texto(c.email, sizeof c.email, email);
     if (telefone) copiar_texto(c.telefone, sizeof c.telefone, telefone);
     if (endereco) copiar_texto(c.endereco, sizeof c.endereco, endereco);
-    if ((st = validar_cliente(bd, &c, cpf ? cpf : atual->cpf)) != OK) return st;
-    *atual = c;
-    return bd_salvar(bd);
+    {
+        char cpf_atual[TAM_CPF];
+        strcpy(cpf_atual, c.cpf);
+        if ((st = validar_cliente(&c, cpf ? cpf : cpf_atual)) != OK) return st;
+    }
+    snprintf(sid, sizeof sid, "%d", id);
+    p[0] = c.nome; p[1] = c.cpf; p[2] = ou_nulo(c.email);
+    p[3] = ou_nulo(c.telefone); p[4] = ou_nulo(c.endereco); p[5] = sid;
+    st = comando(bd,
+                 "UPDATE clientes SET nome = $1, cpf = $2, email = $3, telefone = $4, "
+                 "endereco = $5 WHERE id = $6", 6, p);
+    if (st == ERRO_DUPLICADO) return falha(st, "Já existe um cliente com o CPF %s.", c.cpf);
+    return st;
 }
 
 Status cliente_excluir(BaseDados *bd, int id)
 {
-    int i;
-    Cliente *c = cliente_buscar(bd, id);
-    if (c == NULL) return falha(ERRO_NAO_ENCONTRADO, "Cliente %d não encontrado.", id);
-    for (i = 0; i < bd->n_vendas; i++)
-        if (bd->vendas[i].cliente_id == id)
-            return falha(ERRO_VINCULO,
-                         "Não é possível excluir um cliente que possui vendas registradas.");
-    i = (int)(c - bd->clientes);
-    memmove(c, c + 1, (size_t)(bd->n_clientes - i - 1) * sizeof *c);
-    bd->n_clientes--;
-    return bd_salvar(bd);
+    char sid[16];
+    const char *p[1] = {sid};
+    Status st;
+    if ((st = cliente_buscar(bd, id, NULL)) != OK) return st;
+    snprintf(sid, sizeof sid, "%d", id);
+    st = comando(bd, "DELETE FROM clientes WHERE id = $1", 1, p);
+    if (st == ERRO_VINCULO)
+        return falha(st, "Não é possível excluir um cliente que possui vendas registradas.");
+    return st;
 }
 
-static OrdemCliente ordem_cli_atual;
-
-static int cmp_cliente(const void *a, const void *b)
+int cliente_listar(BaseDados *bd, const char *filtro, OrdemCliente ordem, Cliente **saida)
 {
-    const Cliente *x = *(Cliente *const *)a, *y = *(Cliente *const *)b;
-    int r = 0;
-    if (ordem_cli_atual == ORD_CLI_NOME) r = compara_sem_caixa(x->nome, y->nome);
-    else if (ordem_cli_atual == ORD_CLI_CADASTRO) r = strcmp(x->criado_em, y->criado_em);
-    return r ? r : x->id - y->id;
-}
-
-int cliente_listar(BaseDados *bd, const char *filtro, OrdemCliente ordem, Cliente ***saida)
-{
-    int i, n = 0;
-    Cliente **v = malloc((size_t)(bd->n_clientes + 1) * sizeof *v);
-    *saida = v;
-    if (v == NULL) return 0;
-    for (i = 0; i < bd->n_clientes; i++) {
-        Cliente *c = &bd->clientes[i];
-        if (filtro == NULL || contem_sem_caixa(c->nome, filtro) || contem_sem_caixa(c->cpf, filtro)
-            || contem_sem_caixa(c->email, filtro))
-            v[n++] = c;
-    }
-    ordem_cli_atual = ordem;
-    qsort(v, (size_t)n, sizeof *v, cmp_cliente);
+    static const char *ordens[] = {"nome, id", "id", "criado_em, id"};
+    char sql[512];
+    const char *p[1] = {filtro ? filtro : ""};
+    PGresult *r;
+    int i, n;
+    *saida = NULL;
+    /* a ordenação vem de uma lista fixa, nunca do texto digitado */
+    snprintf(sql, sizeof sql,
+             "SELECT " SQL_CLIENTE_CAMPOS " FROM clientes "
+             "WHERE nome ILIKE '%%' || $1 || '%%' OR cpf LIKE '%%' || $1 || '%%' "
+             "   OR email ILIKE '%%' || $1 || '%%' ORDER BY %s",
+             ordens[ordem]);
+    r = bd_executar(bd, NULL, sql, 1, p);
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); falha(ERRO_MEMORIA, "Memória insuficiente."); return -1; }
+    for (i = 0; i < n; i++) ler_cliente(r, i, &(*saida)[i]);
+    PQclear(r);
     return n;
 }
 
 /* ------------------------------------------------------------ produtos */
 
-Produto *produto_buscar(BaseDados *bd, int id)
+#define SQL_PRODUTO_CAMPOS "id, nome, descricao, (preco * 100)::bigint, estoque"
+
+static void ler_produto(const PGresult *r, int l, Produto *p)
 {
-    int i;
-    for (i = 0; i < bd->n_produtos; i++)
-        if (bd->produtos[i].id == id) return &bd->produtos[i];
-    return NULL;
+    p->id = pg_int(r, l, 0);
+    pg_txt(r, l, 1, p->nome, sizeof p->nome);
+    pg_txt(r, l, 2, p->descricao, sizeof p->descricao);
+    p->preco = pg_ll(r, l, 3);
+    p->estoque = pg_int(r, l, 4);
 }
 
 static Status validar_produto(const Produto *p)
 {
     if (p->nome[0] == '\0') return falha(ERRO_VALIDACAO, "O nome do produto é obrigatório.");
     if (p->preco < 0) return falha(ERRO_VALIDACAO, "O preço não pode ser negativo.");
+    if (p->preco > 999999999999LL) return falha(ERRO_VALIDACAO, "Preço muito alto.");
     if (p->estoque < 0) return falha(ERRO_VALIDACAO, "O estoque não pode ser negativo.");
     return OK;
 }
@@ -446,111 +337,148 @@ Status produto_cadastrar(BaseDados *bd, const char *nome, const char *descricao,
 {
     Produto p;
     Status st;
+    PGresult *r;
+    char spreco[32], sestoque[16];
+    const char *params[4];
     memset(&p, 0, sizeof p);
-    p.id = bd->prox_produto;
     copiar_texto(p.nome, sizeof p.nome, nome);
     copiar_texto(p.descricao, sizeof p.descricao, descricao);
     p.preco = preco;
     p.estoque = estoque;
     if ((st = validar_produto(&p)) != OK) return st;
-    if (!garantir((void **)&bd->produtos, &bd->cap_produtos, bd->n_produtos + 1, sizeof p))
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
-    bd->produtos[bd->n_produtos++] = p;
-    bd->prox_produto++;
-    if (novo_id) *novo_id = p.id;
-    return bd_salvar(bd);
+    snprintf(spreco, sizeof spreco, "%lld", preco);
+    snprintf(sestoque, sizeof sestoque, "%d", estoque);
+    params[0] = p.nome; params[1] = ou_nulo(p.descricao); params[2] = spreco; params[3] = sestoque;
+    r = bd_executar(bd, &st,
+                    "INSERT INTO produtos (nome, descricao, preco, estoque) "
+                    "VALUES ($1, $2, $3::bigint / 100.0, $4) RETURNING id", 4, params);
+    if (r == NULL) return st;
+    if (novo_id) *novo_id = pg_int(r, 0, 0);
+    PQclear(r);
+    return OK;
+}
+
+Status produto_buscar(BaseDados *bd, int id, Produto *saida)
+{
+    char sid[16];
+    const char *p[1] = {sid};
+    Status st;
+    PGresult *r;
+    snprintf(sid, sizeof sid, "%d", id);
+    r = bd_executar(bd, &st, "SELECT " SQL_PRODUTO_CAMPOS " FROM produtos WHERE id = $1", 1, p);
+    if (r == NULL) return st;
+    if (PQntuples(r) == 0) st = falha(ERRO_NAO_ENCONTRADO, "Produto %d não encontrado.", id);
+    else if (saida) ler_produto(r, 0, saida);
+    PQclear(r);
+    return st;
 }
 
 Status produto_alterar(BaseDados *bd, int id, const char *nome, const char *descricao,
                        const long long *preco, const int *estoque)
 {
-    Produto *atual = produto_buscar(bd, id);
     Produto p;
     Status st;
-    if (atual == NULL) return falha(ERRO_NAO_ENCONTRADO, "Produto %d não encontrado.", id);
-    p = *atual;
+    char sid[16], spreco[32], sestoque[16];
+    const char *params[5];
+    if ((st = produto_buscar(bd, id, &p)) != OK) return st;
     if (nome) copiar_texto(p.nome, sizeof p.nome, nome);
     if (descricao) copiar_texto(p.descricao, sizeof p.descricao, descricao);
     if (preco) p.preco = *preco;
     if (estoque) p.estoque = *estoque;
     if ((st = validar_produto(&p)) != OK) return st;
-    *atual = p;
-    return bd_salvar(bd);
+    snprintf(sid, sizeof sid, "%d", id);
+    snprintf(spreco, sizeof spreco, "%lld", p.preco);
+    snprintf(sestoque, sizeof sestoque, "%d", p.estoque);
+    params[0] = p.nome; params[1] = ou_nulo(p.descricao); params[2] = spreco;
+    params[3] = sestoque; params[4] = sid;
+    return comando(bd,
+                   "UPDATE produtos SET nome = $1, descricao = $2, preco = $3::bigint / 100.0, "
+                   "estoque = $4 WHERE id = $5", 5, params);
 }
 
 Status produto_excluir(BaseDados *bd, int id)
 {
-    int i;
-    Produto *p = produto_buscar(bd, id);
-    if (p == NULL) return falha(ERRO_NAO_ENCONTRADO, "Produto %d não encontrado.", id);
-    for (i = 0; i < bd->n_itens; i++)
-        if (bd->itens[i].produto_id == id)
-            return falha(ERRO_VINCULO, "Não é possível excluir um produto que já foi vendido.");
-    i = (int)(p - bd->produtos);
-    memmove(p, p + 1, (size_t)(bd->n_produtos - i - 1) * sizeof *p);
-    bd->n_produtos--;
-    return bd_salvar(bd);
+    char sid[16];
+    const char *p[1] = {sid};
+    Status st;
+    if ((st = produto_buscar(bd, id, NULL)) != OK) return st;
+    snprintf(sid, sizeof sid, "%d", id);
+    st = comando(bd, "DELETE FROM produtos WHERE id = $1", 1, p);
+    if (st == ERRO_VINCULO)
+        return falha(st, "Não é possível excluir um produto que já foi vendido.");
+    return st;
 }
 
-static OrdemProduto ordem_prod_atual;
-
-static int cmp_produto(const void *a, const void *b)
+int produto_listar(BaseDados *bd, const char *filtro, OrdemProduto ordem, Produto **saida)
 {
-    const Produto *x = *(Produto *const *)a, *y = *(Produto *const *)b;
-    int r = 0;
-    switch (ordem_prod_atual) {
-    case ORD_PROD_NOME: r = compara_sem_caixa(x->nome, y->nome); break;
-    case ORD_PROD_PRECO: r = (x->preco > y->preco) - (x->preco < y->preco); break;
-    case ORD_PROD_ESTOQUE: r = (x->estoque > y->estoque) - (x->estoque < y->estoque); break;
-    default: break;
-    }
-    return r ? r : x->id - y->id;
-}
-
-int produto_listar(BaseDados *bd, const char *filtro, OrdemProduto ordem, Produto ***saida)
-{
-    int i, n = 0;
-    Produto **v = malloc((size_t)(bd->n_produtos + 1) * sizeof *v);
-    *saida = v;
-    if (v == NULL) return 0;
-    for (i = 0; i < bd->n_produtos; i++) {
-        Produto *p = &bd->produtos[i];
-        if (filtro == NULL || contem_sem_caixa(p->nome, filtro)
-            || contem_sem_caixa(p->descricao, filtro))
-            v[n++] = p;
-    }
-    ordem_prod_atual = ordem;
-    qsort(v, (size_t)n, sizeof *v, cmp_produto);
+    static const char *ordens[] = {"nome, id", "id", "preco, id", "estoque, id"};
+    char sql[512];
+    const char *p[1] = {filtro ? filtro : ""};
+    PGresult *r;
+    int i, n;
+    *saida = NULL;
+    snprintf(sql, sizeof sql,
+             "SELECT " SQL_PRODUTO_CAMPOS " FROM produtos "
+             "WHERE nome ILIKE '%%' || $1 || '%%' OR COALESCE(descricao, '') ILIKE '%%' || $1 || '%%' "
+             "ORDER BY %s",
+             ordens[ordem]);
+    r = bd_executar(bd, NULL, sql, 1, p);
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); falha(ERRO_MEMORIA, "Memória insuficiente."); return -1; }
+    for (i = 0; i < n; i++) ler_produto(r, i, &(*saida)[i]);
+    PQclear(r);
     return n;
 }
 
 /* ------------------------------------------------------------ vendas */
 
-Venda *venda_buscar(BaseDados *bd, int id)
+int bd_ler_vendas(PGresult *r, Venda **saida)
 {
-    int i;
-    for (i = 0; i < bd->n_vendas; i++)
-        if (bd->vendas[i].id == id) return &bd->vendas[i];
-    return NULL;
+    int i, n;
+    *saida = NULL;
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); falha(ERRO_MEMORIA, "Memória insuficiente."); return -1; }
+    for (i = 0; i < n; i++) {
+        Venda *v = &(*saida)[i];
+        v->id = pg_int(r, i, 0);
+        v->cliente_id = pg_int(r, i, 1);
+        pg_txt(r, i, 2, v->cliente_nome, sizeof v->cliente_nome);
+        pg_txt(r, i, 3, v->data, sizeof v->data);
+        v->total = pg_ll(r, i, 4);
+        v->unidades = pg_int(r, i, 5);
+    }
+    PQclear(r);
+    return n;
 }
 
 Status venda_registrar(BaseDados *bd, int cliente_id, const ItemPedido *itens, int n_itens,
                        const char *data, int *novo_id)
 {
     ItemPedido *ag;
-    int i, j, n = 0;
-    Venda v;
+    long long *precos, total = 0;
+    int i, j, n = 0, venda_id = 0;
+    char sid[16], sqtd[16], spid[16], stotal[32], sdata[TAM_DATA];
+    const char *p[4];
+    Status st;
+    PGresult *r;
 
-    if (cliente_buscar(bd, cliente_id) == NULL)
-        return falha(ERRO_NAO_ENCONTRADO, "Cliente %d não encontrado.", cliente_id);
+    if ((st = cliente_buscar(bd, cliente_id, NULL)) != OK) return st;
     if (n_itens <= 0) return falha(ERRO_VALIDACAO, "A venda deve conter pelo menos um item.");
 
     /* 1) agrupa produtos repetidos */
     ag = malloc((size_t)n_itens * sizeof *ag);
-    if (ag == NULL) return falha(ERRO_MEMORIA, "Memória insuficiente.");
+    precos = malloc((size_t)n_itens * sizeof *precos);
+    if (ag == NULL || precos == NULL) {
+        free(ag); free(precos);
+        return falha(ERRO_MEMORIA, "Memória insuficiente.");
+    }
     for (i = 0; i < n_itens; i++) {
         if (itens[i].quantidade <= 0) {
-            free(ag);
+            free(ag); free(precos);
             return falha(ERRO_VALIDACAO, "A quantidade de cada item deve ser maior que zero.");
         }
         for (j = 0; j < n && ag[j].produto_id != itens[i].produto_id; j++) {}
@@ -558,97 +486,139 @@ Status venda_registrar(BaseDados *bd, int cliente_id, const ItemPedido *itens, i
         else ag[j].quantidade += itens[i].quantidade;
     }
 
-    /* 2) valida tudo antes de alterar qualquer dado */
-    for (j = 0; j < n; j++) {
-        Produto *p = produto_buscar(bd, ag[j].produto_id);
-        if (p == NULL) {
-            Status st = falha(ERRO_NAO_ENCONTRADO, "Produto %d não encontrado.", ag[j].produto_id);
-            free(ag);
-            return st;
+    /* 2) transação: tudo ou nada */
+    if ((st = iniciar(bd)) != OK) { free(ag); free(precos); return st; }
+
+    /* trava as linhas dos produtos (FOR UPDATE) para que duas vendas
+     * simultâneas não vendam o mesmo estoque */
+    for (j = 0; j < n && st == OK; j++) {
+        snprintf(spid, sizeof spid, "%d", ag[j].produto_id);
+        p[0] = spid;
+        r = bd_executar(bd, &st,
+                        "SELECT nome, estoque, (preco * 100)::bigint FROM produtos "
+                        "WHERE id = $1 FOR UPDATE", 1, p);
+        if (r == NULL) break;
+        if (PQntuples(r) == 0)
+            st = falha(ERRO_NAO_ENCONTRADO, "Produto %d não encontrado.", ag[j].produto_id);
+        else if (pg_int(r, 0, 1) < ag[j].quantidade)
+            st = falha(ERRO_ESTOQUE,
+                       "Estoque insuficiente para '%s' (disponível: %d, solicitado: %d).",
+                       PQgetvalue(r, 0, 0), pg_int(r, 0, 1), ag[j].quantidade);
+        else {
+            precos[j] = pg_ll(r, 0, 2);
+            total += precos[j] * ag[j].quantidade;
         }
-        if (p->estoque < ag[j].quantidade) {
-            Status st = falha(ERRO_ESTOQUE,
-                              "Estoque insuficiente para '%s' (disponível: %d, solicitado: %d).",
-                              p->nome, p->estoque, ag[j].quantidade);
-            free(ag);
-            return st;
-        }
-    }
-    if (!garantir((void **)&bd->vendas, &bd->cap_vendas, bd->n_vendas + 1, sizeof v)
-        || !garantir((void **)&bd->itens, &bd->cap_itens, bd->n_itens + n, sizeof *bd->itens)) {
-        free(ag);
-        return falha(ERRO_MEMORIA, "Memória insuficiente.");
+        PQclear(r);
     }
 
-    /* 3) grava a venda, os itens (com o preço atual) e baixa o estoque */
-    memset(&v, 0, sizeof v);
-    v.id = bd->prox_venda++;
-    v.cliente_id = cliente_id;
-    if (data) copiar_texto(v.data, sizeof v.data, data);
-    else data_agora(v.data);
-    for (j = 0; j < n; j++) {
-        Produto *p = produto_buscar(bd, ag[j].produto_id);
-        ItemVenda *it = &bd->itens[bd->n_itens++];
-        it->venda_id = v.id;
-        it->produto_id = p->id;
-        it->quantidade = ag[j].quantidade;
-        it->preco_unitario = p->preco;
-        p->estoque -= ag[j].quantidade;
-        v.total += (long long)ag[j].quantidade * p->preco;
+    /* 3) grava a venda */
+    if (st == OK) {
+        snprintf(sid, sizeof sid, "%d", cliente_id);
+        snprintf(stotal, sizeof stotal, "%lld", total);
+        if (data) copiar_texto(sdata, sizeof sdata, data);
+        p[0] = sid; p[1] = data ? sdata : NULL; p[2] = stotal;
+        r = bd_executar(bd, &st,
+                        "INSERT INTO vendas (cliente_id, data, total) "
+                        "VALUES ($1, COALESCE($2::timestamp, LOCALTIMESTAMP(0)), $3::bigint / 100.0) "
+                        "RETURNING id", 3, p);
+        if (r) { venda_id = pg_int(r, 0, 0); PQclear(r); }
     }
-    bd->vendas[bd->n_vendas++] = v;
+
+    /* 4) grava os itens com o preço atual e baixa o estoque */
+    snprintf(sid, sizeof sid, "%d", venda_id);
+    for (j = 0; j < n && st == OK; j++) {
+        char spreco[32];
+        snprintf(spid, sizeof spid, "%d", ag[j].produto_id);
+        snprintf(sqtd, sizeof sqtd, "%d", ag[j].quantidade);
+        snprintf(spreco, sizeof spreco, "%lld", precos[j]);
+        p[0] = sid; p[1] = spid; p[2] = sqtd; p[3] = spreco;
+        st = comando(bd,
+                     "INSERT INTO itens_venda (venda_id, produto_id, quantidade, preco_unitario) "
+                     "VALUES ($1, $2, $3, $4::bigint / 100.0)", 4, p);
+        if (st == OK) {
+            p[0] = sqtd; p[1] = spid;
+            st = comando(bd, "UPDATE produtos SET estoque = estoque - $1 WHERE id = $2", 2, p);
+        }
+    }
+
     free(ag);
-    if (novo_id) *novo_id = v.id;
-    return bd_salvar(bd);
+    free(precos);
+    if (st == OK) st = confirmar_transacao(bd);
+    if (st != OK) { desfazer(bd); return st; }
+    if (novo_id) *novo_id = venda_id;
+    return OK;
 }
 
-int venda_itens(BaseDados *bd, int venda_id, ItemVenda ***saida)
+Status venda_buscar(BaseDados *bd, int id, Venda *saida)
 {
-    int i, n = 0;
-    ItemVenda **v = malloc((size_t)(bd->n_itens + 1) * sizeof *v);
-    *saida = v;
-    if (v == NULL) return 0;
-    for (i = 0; i < bd->n_itens; i++)
-        if (bd->itens[i].venda_id == venda_id) v[n++] = &bd->itens[i];
+    char sid[16];
+    const char *p[1] = {sid};
+    Venda *v;
+    int n;
+    snprintf(sid, sizeof sid, "%d", id);
+    n = bd_ler_vendas(bd_executar(bd, NULL,
+                                  "SELECT " SQL_VENDA_CAMPOS
+                                  "FROM vendas v JOIN clientes c ON c.id = v.cliente_id "
+                                  "WHERE v.id = $1", 1, p),
+                      &v);
+    if (n < 0) return ERRO_BANCO;
+    if (n == 0) { free(v); return falha(ERRO_NAO_ENCONTRADO, "Venda %d não encontrada.", id); }
+    if (saida) *saida = v[0];
+    free(v);
+    return OK;
+}
+
+int venda_itens(BaseDados *bd, int venda_id, ItemVenda **saida)
+{
+    char sid[16];
+    const char *p[1] = {sid};
+    PGresult *r;
+    int i, n;
+    *saida = NULL;
+    snprintf(sid, sizeof sid, "%d", venda_id);
+    r = bd_executar(bd, NULL,
+                    "SELECT i.produto_id, p.nome, i.quantidade, (i.preco_unitario * 100)::bigint, "
+                    "       (i.quantidade * i.preco_unitario * 100)::bigint "
+                    "FROM itens_venda i JOIN produtos p ON p.id = i.produto_id "
+                    "WHERE i.venda_id = $1 ORDER BY i.id", 1, p);
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); falha(ERRO_MEMORIA, "Memória insuficiente."); return -1; }
+    for (i = 0; i < n; i++) {
+        ItemVenda *it = &(*saida)[i];
+        it->produto_id = pg_int(r, i, 0);
+        pg_txt(r, i, 1, it->produto_nome, sizeof it->produto_nome);
+        it->quantidade = pg_int(r, i, 2);
+        it->preco_unitario = pg_ll(r, i, 3);
+        it->subtotal = pg_ll(r, i, 4);
+    }
+    PQclear(r);
     return n;
 }
 
-static int cmp_venda_desc(const void *a, const void *b)
+int venda_listar(BaseDados *bd, Venda **saida)
 {
-    const Venda *x = *(Venda *const *)a, *y = *(Venda *const *)b;
-    int r = strcmp(y->data, x->data);
-    return r ? r : y->id - x->id;
-}
-
-int venda_listar(BaseDados *bd, Venda ***saida)
-{
-    int i;
-    Venda **v = malloc((size_t)(bd->n_vendas + 1) * sizeof *v);
-    *saida = v;
-    if (v == NULL) return 0;
-    for (i = 0; i < bd->n_vendas; i++) v[i] = &bd->vendas[i];
-    qsort(v, (size_t)bd->n_vendas, sizeof *v, cmp_venda_desc);
-    return bd->n_vendas;
+    return bd_ler_vendas(bd_executar(bd, NULL,
+                                     "SELECT " SQL_VENDA_CAMPOS
+                                     "FROM vendas v JOIN clientes c ON c.id = v.cliente_id "
+                                     "ORDER BY v.data DESC, v.id DESC", 0, NULL),
+                         saida);
 }
 
 Status venda_cancelar(BaseDados *bd, int id)
 {
-    int i, k = 0;
-    Venda *v = venda_buscar(bd, id);
-    if (v == NULL) return falha(ERRO_NAO_ENCONTRADO, "Venda %d não encontrada.", id);
-    /* devolve ao estoque e remove os itens */
-    for (i = 0; i < bd->n_itens; i++) {
-        ItemVenda *it = &bd->itens[i];
-        if (it->venda_id == id) {
-            Produto *p = produto_buscar(bd, it->produto_id);
-            if (p) p->estoque += it->quantidade;
-        } else {
-            bd->itens[k++] = *it;
-        }
-    }
-    bd->n_itens = k;
-    i = (int)(v - bd->vendas);
-    memmove(v, v + 1, (size_t)(bd->n_vendas - i - 1) * sizeof *v);
-    bd->n_vendas--;
-    return bd_salvar(bd);
+    char sid[16];
+    const char *p[1] = {sid};
+    Status st;
+    if ((st = venda_buscar(bd, id, NULL)) != OK) return st;
+    snprintf(sid, sizeof sid, "%d", id);
+    if ((st = iniciar(bd)) != OK) return st;
+    st = comando(bd,
+                 "UPDATE produtos p SET estoque = p.estoque + i.quantidade "
+                 "FROM itens_venda i WHERE i.venda_id = $1 AND p.id = i.produto_id", 1, p);
+    if (st == OK) st = comando(bd, "DELETE FROM vendas WHERE id = $1", 1, p); /* itens: CASCADE */
+    if (st == OK) st = confirmar_transacao(bd);
+    if (st != OK) desfazer(bd);
+    return st;
 }

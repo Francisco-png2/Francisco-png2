@@ -1,245 +1,211 @@
 /*
- * relatorios.c - Cálculo dos relatórios gerenciais.
+ * relatorios.c - Relatórios gerenciais calculados com SQL no PostgreSQL.
  */
+#define __USE_MINGW_ANSI_STDIO 1
+
 #include "relatorios.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* ------------------------------------------------------------ apoio */
-
-static int cmp_ll_desc(long long a, long long b) { return (a < b) - (a > b); }
 
 static int periodo_valido(const char *inicio, const char *fim)
 {
     return inicio && fim && strlen(inicio) == 10 && strlen(fim) == 10 && strcmp(inicio, fim) <= 0;
 }
 
-static int na_data(const char *data, const char *inicio, const char *fim)
-{
-    return strncmp(data, inicio, 10) >= 0 && strncmp(data, fim, 10) <= 0;
-}
-
 /* ------------------------------------------------------------ clientes */
 
-/* Monta o resumo de compras de cada cliente que comprou pelo menos uma vez. */
-static int resumo_clientes(BaseDados *bd, RelCliente **saida)
+static int consultar_clientes(BaseDados *bd, const char *ordem, int limite, RelCliente **saida)
 {
-    int i, j, n = 0;
-    RelCliente *r = calloc((size_t)bd->n_clientes + 1, sizeof *r);
-    *saida = r;
-    if (r == NULL) return 0;
-    for (i = 0; i < bd->n_clientes; i++) {
-        const Cliente *c = &bd->clientes[i];
-        RelCliente x;
-        memset(&x, 0, sizeof x);
-        for (j = 0; j < bd->n_vendas; j++) {
-            if (bd->vendas[j].cliente_id == c->id) {
-                x.qtd_compras++;
-                x.valor_total += bd->vendas[j].total;
-            }
-        }
-        if (x.qtd_compras == 0) continue;
-        x.cliente_id = c->id;
-        strcpy(x.nome, c->nome);
-        x.ticket_medio = (x.valor_total + x.qtd_compras / 2) / x.qtd_compras;
-        r[n++] = x;
+    char sql[1024], slim[16];
+    const char *p[1] = {slim};
+    PGresult *r;
+    int i, n;
+    *saida = NULL;
+    snprintf(slim, sizeof slim, "%d", limite > 0 ? limite : 1000000);
+    snprintf(sql, sizeof sql,
+             "SELECT c.id, c.nome, COUNT(v.id) AS qtd_compras, "
+             "       (SUM(v.total) * 100)::bigint AS valor_total, "
+             "       (ROUND(AVG(v.total), 2) * 100)::bigint AS ticket_medio "
+             "FROM clientes c JOIN vendas v ON v.cliente_id = c.id "
+             "GROUP BY c.id, c.nome "
+             "ORDER BY %s, c.nome LIMIT $1",
+             ordem);
+    r = bd_executar(bd, NULL, sql, 1, p);
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); return -1; }
+    for (i = 0; i < n; i++) {
+        RelCliente *x = &(*saida)[i];
+        x->cliente_id = pg_int(r, i, 0);
+        pg_txt(r, i, 1, x->nome, sizeof x->nome);
+        x->qtd_compras = pg_int(r, i, 2);
+        x->valor_total = pg_ll(r, i, 3);
+        x->ticket_medio = pg_ll(r, i, 4);
     }
+    PQclear(r);
     return n;
-}
-
-static int cmp_cli_qtd(const void *a, const void *b)
-{
-    const RelCliente *x = a, *y = b;
-    int r = y->qtd_compras - x->qtd_compras;
-    if (!r) r = cmp_ll_desc(x->valor_total, y->valor_total);
-    return r ? r : strcmp(x->nome, y->nome);
-}
-
-static int cmp_cli_valor(const void *a, const void *b)
-{
-    const RelCliente *x = a, *y = b;
-    int r = cmp_ll_desc(x->valor_total, y->valor_total);
-    if (!r) r = y->qtd_compras - x->qtd_compras;
-    return r ? r : strcmp(x->nome, y->nome);
 }
 
 int rel_melhores_clientes(BaseDados *bd, int por_valor, int limite, RelCliente **saida)
 {
-    int n = resumo_clientes(bd, saida);
-    qsort(*saida, (size_t)n, sizeof **saida, por_valor ? cmp_cli_valor : cmp_cli_qtd);
-    return (limite > 0 && n > limite) ? limite : n;
+    return consultar_clientes(bd,
+                              por_valor ? "valor_total DESC, qtd_compras DESC"
+                                        : "qtd_compras DESC, valor_total DESC",
+                              limite, saida);
 }
 
 int rel_clientes_maior_valor(BaseDados *bd, int limite, RelCliente **saida)
 {
-    return rel_melhores_clientes(bd, 1, limite, saida);
+    return consultar_clientes(bd, "valor_total DESC, qtd_compras DESC", limite, saida);
 }
 
 /* ------------------------------------------------------------ produtos */
 
-/* Estatísticas de todos os produtos (inclusive os nunca vendidos). */
-static int resumo_produtos(BaseDados *bd, RelProduto **saida)
+/* somente_vendidos = 1 usa JOIN (só produtos com vendas); 0 usa LEFT JOIN (todos). */
+static int consultar_produtos(BaseDados *bd, int somente_vendidos, int produto_id,
+                              const char *ordem, int limite, RelProduto **saida)
 {
-    int i, j;
-    long long total_geral = 0;
-    RelProduto *r = calloc((size_t)bd->n_produtos + 1, sizeof *r);
-    *saida = r;
-    if (r == NULL) return 0;
-    for (i = 0; i < bd->n_produtos; i++) {
-        const Produto *p = &bd->produtos[i];
-        r[i].produto_id = p->id;
-        strcpy(r[i].nome, p->nome);
-        for (j = 0; j < bd->n_itens; j++) {
-            const ItemVenda *it = &bd->itens[j];
-            if (it->produto_id != p->id) continue;
-            r[i].qtd_vendas++; /* cada venda tem no máximo um item por produto */
-            r[i].unidades += it->quantidade;
-            r[i].faturamento += (long long)it->quantidade * it->preco_unitario;
-        }
-        total_geral += r[i].faturamento;
+    char sql[1536], slim[16], spid[16];
+    const char *p[2] = {spid, slim};
+    PGresult *r;
+    int i, n;
+    *saida = NULL;
+    snprintf(spid, sizeof spid, "%d", produto_id);
+    snprintf(slim, sizeof slim, "%d", limite > 0 ? limite : 1000000);
+    snprintf(sql, sizeof sql,
+             "SELECT p.id, p.nome, "
+             "       COUNT(DISTINCT i.venda_id) AS qtd_vendas, "
+             "       COALESCE(SUM(i.quantidade), 0) AS unidades, "
+             "       (COALESCE(SUM(i.quantidade * i.preco_unitario), 0) * 100)::bigint AS faturamento, "
+             "       COALESCE(ROUND(100.0 * SUM(i.quantidade * i.preco_unitario) / "
+             "         NULLIF((SELECT SUM(quantidade * preco_unitario) FROM itens_venda), 0), 2), 0) "
+             "FROM produtos p %s JOIN itens_venda i ON i.produto_id = p.id "
+             "WHERE $1::int = 0 OR p.id = $1::int "
+             "GROUP BY p.id, p.nome "
+             "ORDER BY %s, p.nome LIMIT $2",
+             somente_vendidos ? "" : "LEFT", ordem);
+    r = bd_executar(bd, NULL, sql, 2, p);
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); return -1; }
+    for (i = 0; i < n; i++) {
+        RelProduto *x = &(*saida)[i];
+        x->produto_id = pg_int(r, i, 0);
+        pg_txt(r, i, 1, x->nome, sizeof x->nome);
+        x->qtd_vendas = pg_int(r, i, 2);
+        x->unidades = pg_int(r, i, 3);
+        x->faturamento = pg_ll(r, i, 4);
+        x->participacao = atof(PQgetvalue(r, i, 5));
     }
-    for (i = 0; i < bd->n_produtos; i++)
-        r[i].participacao = total_geral ? 100.0 * (double)r[i].faturamento / (double)total_geral : 0;
-    return bd->n_produtos;
-}
-
-/* Remove os produtos que nunca foram vendidos. */
-static int somente_vendidos(RelProduto *r, int n)
-{
-    int i, k = 0;
-    for (i = 0; i < n; i++)
-        if (r[i].unidades > 0) r[k++] = r[i];
-    return k;
-}
-
-static int cmp_prod_unidades(const void *a, const void *b)
-{
-    const RelProduto *x = a, *y = b;
-    int r = y->unidades - x->unidades;
-    if (!r) r = cmp_ll_desc(x->faturamento, y->faturamento);
-    return r ? r : strcmp(x->nome, y->nome);
-}
-
-static int cmp_prod_faturamento(const void *a, const void *b)
-{
-    const RelProduto *x = a, *y = b;
-    int r = cmp_ll_desc(x->faturamento, y->faturamento);
-    return r ? r : strcmp(x->nome, y->nome);
-}
-
-static int cmp_prod_vendas(const void *a, const void *b)
-{
-    const RelProduto *x = a, *y = b;
-    int r = y->qtd_vendas - x->qtd_vendas;
-    if (!r) r = cmp_ll_desc(x->faturamento, y->faturamento);
-    return r ? r : strcmp(x->nome, y->nome);
+    PQclear(r);
+    return n;
 }
 
 int rel_produtos_mais_vendidos(BaseDados *bd, int limite, RelProduto **saida)
 {
-    int n = resumo_produtos(bd, saida);
-    n = somente_vendidos(*saida, n);
-    qsort(*saida, (size_t)n, sizeof **saida, cmp_prod_unidades);
-    return (limite > 0 && n > limite) ? limite : n;
+    return consultar_produtos(bd, 1, 0, "unidades DESC, faturamento DESC", limite, saida);
 }
 
 int rel_produtos_maior_faturamento(BaseDados *bd, int limite, RelProduto **saida)
 {
-    int n = resumo_produtos(bd, saida);
-    n = somente_vendidos(*saida, n);
-    qsort(*saida, (size_t)n, sizeof **saida, cmp_prod_faturamento);
-    return (limite > 0 && n > limite) ? limite : n;
+    return consultar_produtos(bd, 1, 0, "faturamento DESC", limite, saida);
 }
 
 int rel_desempenho_produtos(BaseDados *bd, int produto_id, RelProduto **saida)
 {
-    int i, n = resumo_produtos(bd, saida);
-    if (produto_id > 0) {
-        for (i = 0; i < n && (*saida)[i].produto_id != produto_id; i++) {}
-        if (i == n) return 0;
-        (*saida)[0] = (*saida)[i];
-        return 1;
-    }
-    qsort(*saida, (size_t)n, sizeof **saida, cmp_prod_vendas);
-    return n;
+    return consultar_produtos(bd, 0, produto_id, "qtd_vendas DESC, faturamento DESC", 0, saida);
 }
 
 /* ------------------------------------------------------------ vendas */
 
-static int cmp_venda_asc(const void *a, const void *b)
+int rel_vendas_periodo(BaseDados *bd, const char *inicio, const char *fim, Venda **saida)
 {
-    const Venda *x = *(Venda *const *)a, *y = *(Venda *const *)b;
-    int r = strcmp(x->data, y->data);
-    return r ? r : x->id - y->id;
-}
-
-int rel_vendas_periodo(BaseDados *bd, const char *inicio, const char *fim, Venda ***saida)
-{
-    int i, n = 0;
-    Venda **v;
+    const char *p[2] = {inicio, fim};
     *saida = NULL;
     if (!periodo_valido(inicio, fim)) return -1;
-    v = malloc((size_t)(bd->n_vendas + 1) * sizeof *v);
-    *saida = v;
-    if (v == NULL) return 0;
-    for (i = 0; i < bd->n_vendas; i++)
-        if (na_data(bd->vendas[i].data, inicio, fim)) v[n++] = &bd->vendas[i];
-    qsort(v, (size_t)n, sizeof *v, cmp_venda_asc);
-    return n;
+    /* data < fim + 1 dia: inclui o último dia inteiro (até 23:59:59) */
+    return bd_ler_vendas(bd_executar(bd, NULL,
+                                     "SELECT " SQL_VENDA_CAMPOS
+                                     "FROM vendas v JOIN clientes c ON c.id = v.cliente_id "
+                                     "WHERE v.data >= $1::date AND v.data < $2::date + 1 "
+                                     "ORDER BY v.data, v.id", 2, p),
+                         saida);
 }
 
 Status rel_faturamento_periodo(BaseDados *bd, const char *inicio, const char *fim,
                                RelFaturamento *saida)
 {
-    Venda **v;
-    int i, n = rel_vendas_periodo(bd, inicio, fim, &v);
+    const char *p[2] = {inicio, fim};
+    PGresult *r;
+    Status st;
+    int i;
     memset(saida, 0, sizeof *saida);
-    if (n < 0) return ERRO_VALIDACAO;
-    saida->dias = calloc((size_t)n + 1, sizeof *saida->dias);
-    if (saida->dias == NULL) { free(v); return ERRO_MEMORIA; }
-    for (i = 0; i < n; i++) { /* vendas já estão em ordem cronológica */
-        RelDia *d = saida->n_dias ? &saida->dias[saida->n_dias - 1] : NULL;
-        if (d == NULL || strncmp(d->dia, v[i]->data, 10) != 0) {
-            d = &saida->dias[saida->n_dias++];
-            memcpy(d->dia, v[i]->data, 10);
-            d->dia[10] = '\0';
-        }
-        d->qtd_vendas++;
-        d->faturamento += v[i]->total;
-        saida->qtd_vendas++;
-        saida->faturamento += v[i]->total;
+    if (!periodo_valido(inicio, fim)) return ERRO_VALIDACAO;
+
+    r = bd_executar(bd, &st,
+                    "SELECT COUNT(*), (COALESCE(SUM(total), 0) * 100)::bigint, "
+                    "       (COALESCE(ROUND(AVG(total), 2), 0) * 100)::bigint "
+                    "FROM vendas WHERE data >= $1::date AND data < $2::date + 1", 2, p);
+    if (r == NULL) return st;
+    saida->qtd_vendas = pg_int(r, 0, 0);
+    saida->faturamento = pg_ll(r, 0, 1);
+    saida->ticket_medio = pg_ll(r, 0, 2);
+    PQclear(r);
+
+    r = bd_executar(bd, &st,
+                    "SELECT to_char(data::date, 'YYYY-MM-DD'), COUNT(*), "
+                    "       (SUM(total) * 100)::bigint "
+                    "FROM vendas WHERE data >= $1::date AND data < $2::date + 1 "
+                    "GROUP BY data::date ORDER BY data::date", 2, p);
+    if (r == NULL) return st;
+    saida->n_dias = PQntuples(r);
+    saida->dias = calloc((size_t)saida->n_dias + 1, sizeof *saida->dias);
+    if (saida->dias == NULL) { PQclear(r); return ERRO_MEMORIA; }
+    for (i = 0; i < saida->n_dias; i++) {
+        pg_txt(r, i, 0, saida->dias[i].dia, sizeof saida->dias[i].dia);
+        saida->dias[i].qtd_vendas = pg_int(r, i, 1);
+        saida->dias[i].faturamento = pg_ll(r, i, 2);
     }
-    if (saida->qtd_vendas)
-        saida->ticket_medio = (saida->faturamento + saida->qtd_vendas / 2) / saida->qtd_vendas;
-    free(v);
+    PQclear(r);
     return OK;
 }
 
 int rel_historico_cliente(BaseDados *bd, int cliente_id, RelHistorico **saida)
 {
-    Venda **v;
-    int i, j, n = 0, nv = venda_listar(bd, &v); /* mais recentes primeiro */
-    RelHistorico *r = calloc((size_t)bd->n_itens + 1, sizeof *r);
-    *saida = r;
-    if (r == NULL) { free(v); return 0; }
-    for (i = 0; i < nv; i++) {
-        if (v[i]->cliente_id != cliente_id) continue;
-        for (j = 0; j < bd->n_itens; j++) {
-            const ItemVenda *it = &bd->itens[j];
-            const Produto *p;
-            if (it->venda_id != v[i]->id) continue;
-            p = produto_buscar(bd, it->produto_id);
-            r[n].venda_id = v[i]->id;
-            strcpy(r[n].data, v[i]->data);
-            strcpy(r[n].produto, p ? p->nome : "(produto removido)");
-            r[n].quantidade = it->quantidade;
-            r[n].preco_unitario = it->preco_unitario;
-            r[n].subtotal = (long long)it->quantidade * it->preco_unitario;
-            r[n].total_venda = v[i]->total;
-            n++;
-        }
+    char sid[16];
+    const char *p[1] = {sid};
+    PGresult *r;
+    int i, n;
+    *saida = NULL;
+    snprintf(sid, sizeof sid, "%d", cliente_id);
+    r = bd_executar(bd, NULL,
+                    "SELECT v.id, to_char(v.data, 'YYYY-MM-DD HH24:MI:SS'), p.nome, i.quantidade, "
+                    "       (i.preco_unitario * 100)::bigint, "
+                    "       (i.quantidade * i.preco_unitario * 100)::bigint, "
+                    "       (v.total * 100)::bigint "
+                    "FROM vendas v "
+                    "JOIN itens_venda i ON i.venda_id = v.id "
+                    "JOIN produtos p ON p.id = i.produto_id "
+                    "WHERE v.cliente_id = $1 "
+                    "ORDER BY v.data DESC, v.id DESC, i.id", 1, p);
+    if (r == NULL) return -1;
+    n = PQntuples(r);
+    *saida = calloc((size_t)n + 1, sizeof **saida);
+    if (*saida == NULL) { PQclear(r); return -1; }
+    for (i = 0; i < n; i++) {
+        RelHistorico *x = &(*saida)[i];
+        x->venda_id = pg_int(r, i, 0);
+        pg_txt(r, i, 1, x->data, sizeof x->data);
+        pg_txt(r, i, 2, x->produto, sizeof x->produto);
+        x->quantidade = pg_int(r, i, 3);
+        x->preco_unitario = pg_ll(r, i, 4);
+        x->subtotal = pg_ll(r, i, 5);
+        x->total_venda = pg_ll(r, i, 6);
     }
-    free(v);
+    PQclear(r);
     return n;
 }
